@@ -1,1 +1,189 @@
+# Assignment 01 — Vector Database Practice
 
+**Notebook:** sentence embeddings, local similarity search, and Pinecone vector search.
+
+> Before running API cells, add `GEMINI_API_KEY` and `PINECONE_API_KEY` in Colab **Secrets** (key icon). Never put keys in notebook code, GitHub, or screenshots. This notebook has not been run automatically; API access and account setup are required for live results.
+
+## 1. Install required packages
+
+
+
+!pip -q install -U google-genai pinecone pandas numpy
+
+
+## 2. Load the sentence dataset
+The original `sentences.csv` dataset is included below, so this notebook does not require a separate CSV upload.
+
+import pandas as pd
+
+sentences = [
+    "A little girl is smiling and running outside",
+    "A man is drawing on a digital dry erase board",
+    "A black bird is sitting on a dead tree",
+    "An elderly man is sitting on a bench",
+    "A man and a woman are sitting comfortably on the bench",
+    "A sheepdog is grouping a herd of sheep",
+    "A man is opening a small package that contains headphones",
+    "The man in a t-shirt dyed grey is sitting on a rock in front of a waterfall",
+    "A woman is not slicing a cucumber",
+]
+dataset = pd.DataFrame({"sentence": sentences})
+dataset["id"] = range(1, len(dataset) + 1)
+dataset.head(10)
+
+
+## 3. Configure Gemini and create embeddings
+Store `GEMINI_API_KEY` in Colab Secrets. The embedding model and 768-dimensional vectors match the original practice notebook.
+
+import os
+import numpy as np
+from google import genai
+from google.genai import types
+from google.colab import userdata
+
+
+GEMINI_API_KEY = userdata.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("Add GEMINI_API_KEY in Colab Secrets, then rerun this cell.")
+client = genai.Client(api_key=GEMINI_API_KEY)
+EMBEDDING_DIM = 768
+EMBEDDING_MODEL = "gemini-embedding-001"
+
+def get_embedding(sentence, task_type="SEMANTIC_SIMILARITY"):
+    result = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=sentence,
+        config=types.EmbedContentConfig(
+            task_type=task_type,
+            output_dimensionality=EMBEDDING_DIM,
+        ),
+    )
+    vec = np.array(result.embeddings[0].values, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    if norm == 0:
+        raise ValueError("Received an empty/zero embedding vector.")
+    return (vec / norm).tolist()
+
+
+## 4. Generate embeddings and save to CSV
+
+# Generate an embedding for each sentence. This cell makes API calls.
+dataset["embedding"] = dataset["sentence"].apply(get_embedding)
+dataset.to_csv("embedded_sentences.csv", index=False)
+dataset.head()
+
+
+## 5. Check embedding dimension
+
+embedding_dimension = len(dataset.loc[0, "embedding"])
+print("Embedding dimension:", embedding_dimension)
+assert embedding_dimension == EMBEDDING_DIM
+
+
+## 6. Prepare the embedding matrix and example query
+
+embeddings = np.array(dataset["embedding"].tolist(), dtype=np.float32)
+query = "I love soccer"
+xq = np.array(get_embedding(query), dtype=np.float32)
+print("Query embedding length:", len(xq))
+
+
+## 7. Local similarity search (NumPy)
+
+def search(query, k=5):
+    query_vector = np.array(get_embedding(query), dtype=np.float32)
+    scores = embeddings @ query_vector  # normalized vectors -> cosine similarity
+    top_idx = np.argsort(scores)[::-1][:k]
+    return dataset.iloc[top_idx][["id", "sentence"]].assign(score=scores[top_idx]).reset_index(drop=True)
+
+search("a man is working hard", 5)
+
+
+## 8. Connect to Pinecone
+Add `PINECONE_API_KEY` to Colab Secrets before running this cell.
+
+from pinecone import Pinecone, ServerlessSpec
+from google.colab import userdata
+
+
+PINECONE_API_KEY = userdata.get("PINECONE_API_KEY")
+if not PINECONE_API_KEY:
+    raise ValueError("Add PINECONE_API_KEY in Colab Secrets, then rerun this cell.")
+database = Pinecone(api_key=PINECONE_API_KEY)
+
+
+## 9. Create or connect to a Pinecone index
+This cell does not delete any existing index.
+
+import time
+INDEX_NAME = "banoqabil-fm"
+
+if INDEX_NAME not in database.list_indexes().names():
+    database.create_index(
+        name=INDEX_NAME,
+        dimension=EMBEDDING_DIM,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
+while not database.describe_index(INDEX_NAME).status["ready"]:
+    time.sleep(1)
+pinecone_index = database.Index(INDEX_NAME)
+database.describe_index(INDEX_NAME)
+
+
+## 10. Inspect index statistics
+
+pinecone_index.describe_index_stats()
+
+
+## 11. Prepare vector records for Pinecone
+Each record contains an ID, normalized embedding vector, and sentence metadata.
+
+def vector(batch):
+    records = []
+    for row in batch.to_dict("records"):
+        records.append({
+            "id": str(row["id"]),
+            "values": row["embedding"],
+            "metadata": {"sentence": row["sentence"]},
+        })
+    return records
+
+vector(dataset)[:2]
+
+
+## 12. Upload vectors (upsert)
+Upsert updates records with matching IDs and adds missing records. This cell sends your dataset to Pinecone.
+
+records = vector(dataset)
+# Upload in batches, avoiding oversized requests.
+for start in range(0, len(records), 100):
+    pinecone_index.upsert(vectors=records[start:start + 100])
+print("Uploaded vectors:", len(records))
+
+
+## 13. Verify uploaded vector count
+
+pinecone_index.describe_index_stats()
+
+
+## 14. Pinecone similarity search — first query
+
+query = "I love soccer"
+xq = get_embedding(query)
+response = pinecone_index.query(vector=xq, top_k=4, include_metadata=True)
+for match in response["matches"]:
+    print(f"{match['score']:.4f}  {match['metadata'].get('sentence', '')}")
+
+
+## 15. Pinecone similarity search — another query
+
+query2 = "a sparrow is eating"
+xq2 = get_embedding(query2)
+response2 = pinecone_index.query(vector=xq2, top_k=5, include_metadata=True)
+for match in response2["matches"]:
+    print(f"{match['score']:.4f}  {match['metadata'].get('sentence', '')}")
+
+
+## 16. Optional cleanup
+No delete commands are included. Do not delete the Pinecone index unless your instructor specifically asks and you understand that it removes stored data.
